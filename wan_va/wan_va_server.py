@@ -1,5 +1,8 @@
 # Copyright 2024-2025 The Robbyant Team Authors. All rights reserved.
 import argparse
+import ast
+import hashlib
+import json
 import os
 import sys
 import time
@@ -420,8 +423,16 @@ class VA_Server:
         self.action_norm_method = self.job_config.action_norm_method
 
         ##### get prompt
+        do_cfg = self.job_config.guidance_scale > 1
+        cache_dir = getattr(self.job_config, 'prompt_embeds_cache_dir', None)
+        cache_file = os.path.join(cache_dir, hashlib.sha1(f"{prompt}|cfg={do_cfg}".encode()).hexdigest() + '.pt') \
+            if cache_dir and prompt is not None else None
         if prompt is None:
             self.prompt_embeds = self.negative_prompt_embeds = None
+        elif cache_file and os.path.exists(cache_file):
+            logger.info(f"prompt embeddings loaded from {cache_file}")
+            cached = torch.load(cache_file, map_location=self.device)
+            self.prompt_embeds, self.negative_prompt_embeds = cached['prompt'], cached['negative']
         else:
             self.prompt_embeds, self.negative_prompt_embeds = self.encode_prompt(
                 prompt=prompt,
@@ -434,6 +445,9 @@ class VA_Server:
                 device=self.device,
                 dtype=self.dtype,
             )
+            if cache_file:
+                os.makedirs(cache_dir, exist_ok=True)
+                torch.save(dict(prompt=self.prompt_embeds, negative=self.negative_prompt_embeds), cache_file)
 
         self.exp_name = f"{prompt}_{time.strftime('%Y%m%d_%H%M%S')}" if prompt else "default"
         self.exp_save_root = os.path.join(self.save_root, 'real', self.exp_name)
@@ -651,11 +665,19 @@ class VA_Server:
         init_obs = self.load_init_obs()
         pred_latent_lst = []
         pred_action_lst = []
+        chunk_seconds = []
+        torch.cuda.reset_peak_memory_stats(self.device)
         for chunk_id in range(self.job_config.num_chunks_to_infer):
+            torch.cuda.synchronize(self.device)
+            t0 = time.perf_counter()
             actions, latents = self._infer(init_obs, frame_st_id=(chunk_id * self.job_config.frame_chunk_size))
+            torch.cuda.synchronize(self.device)
+            chunk_seconds.append(time.perf_counter() - t0)
+            logger.info(f"chunk {chunk_id}: {chunk_seconds[-1]:.2f} s")
             actions = torch.from_numpy(actions)
             pred_latent_lst.append(latents)
             pred_action_lst.append(actions)
+        peak_gb = torch.cuda.max_memory_allocated(self.device) / 1024**3
         pred_latent = torch.cat(pred_latent_lst, dim=2)
         pred_action = torch.cat(pred_action_lst, dim=1).flatten(1)
         self.transformer.clear_cache(self.cache_name)
@@ -671,8 +693,33 @@ class VA_Server:
         if self.enable_offload:
             self.vae = self.vae.to(self.device).to(self.dtype)
         
+        torch.cuda.synchronize(self.device)
+        t0 = time.perf_counter()
         decoded_video = self.decode_one_video(pred_latent, 'np')[0]
+        torch.cuda.synchronize(self.device)
+        decode_seconds = time.perf_counter() - t0
         export_to_video(decoded_video, os.path.join(self.save_root, "demo.mp4"), fps=10)
+        np.save(os.path.join(self.save_root, "actions.npy"), pred_action.numpy())
+        with open(os.path.join(self.save_root, "timing.json"), "w") as f:
+            json.dump(dict(
+                chunk_seconds=chunk_seconds,
+                decode_seconds=decode_seconds,
+                peak_allocated_gb_generation=peak_gb,
+                peak_allocated_gb_total=torch.cuda.max_memory_allocated(self.device) / 1024**3,
+                num_chunks=self.job_config.num_chunks_to_infer,
+                frame_chunk_size=self.job_config.frame_chunk_size,
+                action_per_frame=self.job_config.action_per_frame,
+                num_inference_steps=self.job_config.num_inference_steps,
+                action_num_inference_steps=self.job_config.action_num_inference_steps,
+                guidance_scale=self.job_config.guidance_scale,
+                attn_window=self.job_config.attn_window,
+                prompt=self.job_config.prompt,
+                enable_offload=self.enable_offload,
+                seed=getattr(self.job_config, 'seed', None),
+                video_frames=int(decoded_video.shape[0]),
+                video_shape=list(decoded_video.shape),
+                action_shape=list(pred_action.shape),
+            ), f, indent=2)
 
 def run(args):    
     
@@ -680,6 +727,25 @@ def run(args):
     port = config.port if args.port is None else args.port
     if args.save_root is not None:
         config.save_root = args.save_root
+    if args.model_path is not None:
+        config.wan22_pretrained_model_name_or_path = args.model_path
+    if args.enable_offload is not None:
+        config.enable_offload = args.enable_offload == 'true'
+    if args.num_chunks is not None:
+        config.num_chunks_to_infer = args.num_chunks
+    if args.seed is not None:
+        config.seed = args.seed
+        torch.manual_seed(args.seed)
+    for kv in args.set or []:
+        k, v = kv.split('=', 1)
+        if k not in config and k != 'prompt_embeds_cache_dir':
+            raise KeyError(f"--set {k}: not a key of config {args.config_name}")
+        try:
+            v = ast.literal_eval(v)
+        except (ValueError, SyntaxError):
+            pass  # plain string, e.g. a prompt
+        logger.info(f"config override {k} = {v!r}")
+        config[k] = v
     rank = int(os.getenv("RANK", 0))
     local_rank = int(os.environ.get('LOCAL_RANK', 0))
     world_size = int(os.environ.get("WORLD_SIZE", 1))
@@ -721,6 +787,17 @@ def main():
         default=None,
         help='save root'
     )
+    parser.add_argument("--model_path", type=str, default=None,
+                        help='overrides wan22_pretrained_model_name_or_path')
+    parser.add_argument("--enable_offload", choices=['true', 'false'], default=None,
+                        help='overrides enable_offload (VAE and text encoder on CPU)')
+    parser.add_argument("--num_chunks", type=int, default=None,
+                        help='overrides num_chunks_to_infer (i2va mode)')
+    parser.add_argument("--seed", type=int, default=None,
+                        help='torch.manual_seed before loading (default: unseeded, as upstream)')
+    parser.add_argument("--set", nargs='*', metavar='KEY=VALUE',
+                        help='override config keys, e.g. num_inference_steps=10 attn_window=8; '
+                             'prompt_embeds_cache_dir=<dir> reuses T5 embeddings across runs')
     args = parser.parse_args()
     run(args)
     logger.info("Finish all process!!!!!!!!!!!!")

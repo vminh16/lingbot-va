@@ -28,8 +28,11 @@ from functools import partial
 
 try:
     from flash_attn_interface import flash_attn_func
-except:
-    from flash_attn import flash_attn_func
+except ImportError:
+    try:
+        from flash_attn import flash_attn_func
+    except ImportError:  # only attn_mode='flashattn' needs it; 'torch' uses SDPA
+        flash_attn_func = None
 
 __all__ = ['WanTransformer3DModel']
 
@@ -302,6 +305,8 @@ class WanAttention(torch.nn.Module):
         if attn_mode == 'torch':
             self.attn_op = custom_sdpa
         elif attn_mode == 'flashattn':
+            if flash_attn_func is None:
+                raise ImportError("attn_mode='flashattn' needs flash_attn or flash_attn_interface")
             self.attn_op = flash_attn_func
         elif attn_mode == 'flex':
             self.attn_op = FlexAttnFunc(cross_attention_dim_head is not None)
